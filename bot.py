@@ -10,6 +10,8 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from aiohttp import web
 
+# ---------------- Google Sheets ----------------
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -24,16 +26,59 @@ os.makedirs("data", exist_ok=True)
 DB_PATH = os.path.join("data", "levelbot.sqlite3")
 
 # ======================== GOOGLE SHEETS SETUP ==========================
-SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
-creds = Credentials.from_service_account_file("/etc/secrets/credentials.json", scopes=SCOPE)
-client = gspread.authorize(creds)
+"""
+Deux façons d’identifier ton Google Sheet :
+1) (RECOMMANDÉ) Met une variable d’environnement SHEET_ID (l’ID dans l’URL du Sheet)
+   -> pas besoin d’activer Drive API, scope Sheets suffit.
+2) Sinon, on utilise SHEET_NAME (nom du fichier) -> nécessite Drive API + scope Drive.
+"""
+SHEET_ID = os.getenv("SHEET_ID")            # ex: 1AbCDeFgH... (dans l’URL du Sheet)
+SHEET_NAME = os.getenv("SHEET_NAME", "LevelBotXP")  # nom du document si pas d’ID
 
-SHEET_NAME = "LevelBot XP"  # 🔧 Mets le nom exact de ton Google Sheet
-sheet = client.open(SHEET_NAME).sheet1
+def _load_service_account_credentials(scopes):
+    # 1) Secret File Render
+    if os.path.exists("/etc/secrets/credentials.json"):
+        return Credentials.from_service_account_file("/etc/secrets/credentials.json", scopes=scopes)
+    # 2) Local (tests)
+    if os.path.exists("credentials.json"):
+        return Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    # 3) Var d’env (JSON inline)
+    env_json = os.getenv("GOOGLE_CREDS_JSON")
+    if env_json:
+        info = json.loads(env_json)
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    raise RuntimeError("Aucune clé Google trouvée (ni /etc/secrets/credentials.json, ni credentials.json, ni GOOGLE_CREDS_JSON).")
+
+def _open_sheet():
+    # Si on a SHEET_ID -> aucun besoin Drive
+    if SHEET_ID:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = _load_service_account_credentials(scopes)
+        client = gspread.authorize(creds)
+        return client.open_by_key(SHEET_ID).sheet1
+
+    # Sinon on ouvre par nom -> il faut Drive API + scope Drive
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"  # requis pour open() par nom
+    ]
+    creds = _load_service_account_credentials(scopes)
+    client = gspread.authorize(creds)
+    return client.open(SHEET_NAME).sheet1
+
+try:
+    sheet = _open_sheet()
+    print("✅ Google Sheets connecté.")
+except Exception as e:
+    sheet = None
+    print(f"⚠️ Google Sheets non disponible: {e}")
 
 def save_xp_to_sheets(user_id, username, level, xp):
-    """Sauvegarde le profil utilisateur sur Google Sheets"""
+    """Sauvegarde (upsert) du profil utilisateur dans Google Sheets."""
+    if sheet is None:
+        return  # on n'empêche pas le bot de tourner si Sheets indispo
     try:
+        # Col 1: user_id ; B: username ; C: level ; D: xp ; E: last_update
         all_users = sheet.col_values(1)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -177,7 +222,7 @@ text_cooldowns = {}
 async def grant_xp_and_handle_levelup(member: discord.Member, amount: int):
     guild_id = member.guild.id
     user_id = member.id
-    xp, level, last_ts = get_profile(guild_id, user_id)
+    xp, level, _ = get_profile(guild_id, user_id)
     xp += amount
     leveled_up = False
 
@@ -195,6 +240,7 @@ async def grant_xp_and_handle_levelup(member: discord.Member, amount: int):
                     pass
 
     update_profile(guild_id, user_id, xp, level)
+    # Sauvegarde vers Google Sheets (non bloquant si indispo)
     save_xp_to_sheets(user_id, member.name, level, xp)
     return leveled_up, level, xp
 
@@ -289,7 +335,7 @@ async def roles(ctx):
 # ============================= RENDER SERVER ===========================
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN manquant dans .env")
+        raise SystemExit("❌ DISCORD_TOKEN manquant (variable d’environnement)")
 
     async def health(_):
         return web.Response(text="ok")
