@@ -4,6 +4,7 @@ import random
 import sqlite3
 import time
 from dataclasses import dataclass
+from aiohttp import web
 
 import discord
 from discord.ext import commands
@@ -280,4 +281,27 @@ async def roles(ctx):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN manquant dans .env")
+
+    # --- Mini serveur HTTP pour Render (Web Service) ---
+    import asyncio, os
+    from aiohttp import web
+
+    async def health(_):
+        return web.Response(text="ok")
+
+    async def start_web():
+        app = web.Application()
+        app.router.add_get("/", health)
+        app.router.add_get("/healthz", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.getenv("PORT", "10000"))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+
+    # Démarre le mini-serveur HTTP en parallèle du bot Discord
+    asyncio.get_event_loop().create_task(start_web())
+
+    # Lance le bot
     bot.run(TOKEN)
+
