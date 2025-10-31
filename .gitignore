@@ -1,0 +1,6 @@
+# Empêche d'envoyer ces fichiers sensibles/temporaires
+.env
+levelbot.sqlite3
+__pycache__/
+.venv/
+data/
