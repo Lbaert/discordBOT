@@ -26,19 +26,13 @@ os.makedirs("data", exist_ok=True)
 DB_PATH = os.path.join("data", "levelbot.sqlite3")
 
 # ======================== GOOGLE SHEETS SETUP ==========================
-"""
-Deux façons d’identifier ton Google Sheet :
-1) (RECOMMANDÉ) Met une variable d’environnement SHEET_ID (l’ID dans l’URL du Sheet)
-   -> pas besoin d’activer Drive API, scope Sheets suffit.
-2) Sinon, on utilise SHEET_NAME (nom du fichier) -> nécessite Drive API + scope Drive.
-"""
-# ======================== GOOGLE SHEETS SETUP ==========================
 import json
 import gspread
 from google.oauth2.service_account import Credentials
+from datetime import datetime
 
-SHEET_ID = os.getenv("SHEET_ID")  # recommandé (évite Drive API)
-SHEET_NAME = os.getenv("SHEET_NAME", "LevelBotXP")  # fallback si pas d’ID
+SHEET_ID = os.getenv("SHEET_ID")  # recommandé : ID du fichier (dans l’URL)
+SHEET_NAME = os.getenv("SHEET_NAME", "LevelBotXP")  # fallback par nom si pas d’ID
 
 def _load_service_account_credentials(scopes):
     if os.path.exists("/etc/secrets/credentials.json"):
@@ -49,15 +43,17 @@ def _load_service_account_credentials(scopes):
     if env_json:
         info = json.loads(env_json)
         return Credentials.from_service_account_info(info, scopes=scopes)
-    raise RuntimeError("Aucune clé Google trouvée.")
+    raise RuntimeError("Aucune clé Google trouvée (Render Secret File/credentials.json ou GOOGLE_CREDS_JSON).")
 
 def _open_sheet():
+    # Si on a SHEET_ID -> pas besoin de Drive API
     if SHEET_ID:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = _load_service_account_credentials(scopes)
         client = gspread.authorize(creds)
         return client.open_by_key(SHEET_ID).sheet1
-    # fallback par nom → requiert Drive API + scope Drive
+
+    # Sinon on ouvre par nom -> nécessite Drive API + scope Drive
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -74,55 +70,46 @@ except Exception as e:
     print(f"⚠️ Google Sheets non disponible: {e}")
 
 def _normalize_uid_cell(val: str) -> str:
-    # enlève l’apostrophe éventuelle et les espaces
+    """Nettoie la valeur lue dans la colonne user_id (retire l’apostrophe & espaces)."""
     return (val or "").replace("'", "").strip()
 
 def _find_row_by_user_id(uid: int) -> int | None:
-    """Retourne l’index de ligne (1-based) correspondant à uid, sinon None."""
+    """Retourne l’index (1-based) de la ligne correspondant à uid, sinon None."""
     if sheet is None:
         return None
     uid_str = str(uid)
-    # on lit la colonne A telle qu’affichée (texte)
-    col = sheet.col_values(1)
+    col = sheet.col_values(1)  # Colonne A (user_id)
     for idx, cell in enumerate(col, start=1):
         if _normalize_uid_cell(cell) == uid_str:
             return idx
     return None
 
 def save_xp_to_sheets(user_id, username, level, xp):
-    """Upsert dans Sheets : 1 ligne par user_id (en TEXTE)."""
+    """
+    Upsert dans Sheets : 1 ligne par user_id.
+    - Force l’ID en TEXTE avec un apostrophe en A (ex: '770068...).
+    - Utilise value_input_option='USER_ENTERED' pour empêcher la conversion en notation scientifique.
+    """
     if sheet is None:
         return
     try:
-        uid_text = "'" + str(user_id)  # force le stockage en TEXTE dans Sheets
+        uid_text = "'" + str(user_id)  # <-- clé pour forcer TEXTE dans Sheets
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         row_index = _find_row_by_user_id(user_id)
-        if row_index:  # update
-            # A = user_id (texte), B = username, C = level, D = xp, E = last_update
-            sheet.update(f"A{row_index}:E{row_index}",
-                         [[uid_text, username, level, xp, now]],
-                         value_input_option="USER_ENTERED")
-        else:  # insert
-            sheet.append_row([uid_text, username, level, xp, now],
-                             value_input_option="USER_ENTERED")
-    except Exception as e:
-        print(f"[Google Sheets] Erreur de sauvegarde pour {username}: {e}")
-
-def save_xp_to_sheets(user_id, username, level, xp):
-    """Sauvegarde (upsert) du profil utilisateur dans Google Sheets."""
-    if sheet is None:
-        return  # on n'empêche pas le bot de tourner si Sheets indispo
-    try:
-        # Col 1: user_id ; B: username ; C: level ; D: xp ; E: last_update
-        all_users = sheet.col_values(1)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        if str(user_id) in all_users:
-            row_index = all_users.index(str(user_id)) + 1
-            sheet.update(f"B{row_index}:E{row_index}", [[username, level, xp, now]])
+        if row_index:
+            # Update sur la même ligne
+            sheet.update(
+                f"A{row_index}:E{row_index}",
+                [[uid_text, username, level, xp, now]],
+                value_input_option="USER_ENTERED"  # <-- important
+            )
         else:
-            sheet.append_row([user_id, username, level, xp, now])
+            # Insert d’une nouvelle ligne
+            sheet.append_row(
+                [uid_text, username, level, xp, now],
+                value_input_option="USER_ENTERED"  # <-- important
+            )
     except Exception as e:
         print(f"[Google Sheets] Erreur de sauvegarde pour {username}: {e}")
 
