@@ -32,35 +32,35 @@ Deux façons d’identifier ton Google Sheet :
    -> pas besoin d’activer Drive API, scope Sheets suffit.
 2) Sinon, on utilise SHEET_NAME (nom du fichier) -> nécessite Drive API + scope Drive.
 """
-SHEET_ID = os.getenv("SHEET_ID")            # ex: 1AbCDeFgH... (dans l’URL du Sheet)
-SHEET_NAME = os.getenv("SHEET_NAME", "LevelBotXP")  # nom du document si pas d’ID
+# ======================== GOOGLE SHEETS SETUP ==========================
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+
+SHEET_ID = os.getenv("SHEET_ID")  # recommandé (évite Drive API)
+SHEET_NAME = os.getenv("SHEET_NAME", "LevelBotXP")  # fallback si pas d’ID
 
 def _load_service_account_credentials(scopes):
-    # 1) Secret File Render
     if os.path.exists("/etc/secrets/credentials.json"):
         return Credentials.from_service_account_file("/etc/secrets/credentials.json", scopes=scopes)
-    # 2) Local (tests)
     if os.path.exists("credentials.json"):
         return Credentials.from_service_account_file("credentials.json", scopes=scopes)
-    # 3) Var d’env (JSON inline)
     env_json = os.getenv("GOOGLE_CREDS_JSON")
     if env_json:
         info = json.loads(env_json)
         return Credentials.from_service_account_info(info, scopes=scopes)
-    raise RuntimeError("Aucune clé Google trouvée (ni /etc/secrets/credentials.json, ni credentials.json, ni GOOGLE_CREDS_JSON).")
+    raise RuntimeError("Aucune clé Google trouvée.")
 
 def _open_sheet():
-    # Si on a SHEET_ID -> aucun besoin Drive
     if SHEET_ID:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = _load_service_account_credentials(scopes)
         client = gspread.authorize(creds)
         return client.open_by_key(SHEET_ID).sheet1
-
-    # Sinon on ouvre par nom -> il faut Drive API + scope Drive
+    # fallback par nom → requiert Drive API + scope Drive
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"  # requis pour open() par nom
+        "https://www.googleapis.com/auth/drive",
     ]
     creds = _load_service_account_credentials(scopes)
     client = gspread.authorize(creds)
@@ -72,6 +72,42 @@ try:
 except Exception as e:
     sheet = None
     print(f"⚠️ Google Sheets non disponible: {e}")
+
+def _normalize_uid_cell(val: str) -> str:
+    # enlève l’apostrophe éventuelle et les espaces
+    return (val or "").replace("'", "").strip()
+
+def _find_row_by_user_id(uid: int) -> int | None:
+    """Retourne l’index de ligne (1-based) correspondant à uid, sinon None."""
+    if sheet is None:
+        return None
+    uid_str = str(uid)
+    # on lit la colonne A telle qu’affichée (texte)
+    col = sheet.col_values(1)
+    for idx, cell in enumerate(col, start=1):
+        if _normalize_uid_cell(cell) == uid_str:
+            return idx
+    return None
+
+def save_xp_to_sheets(user_id, username, level, xp):
+    """Upsert dans Sheets : 1 ligne par user_id (en TEXTE)."""
+    if sheet is None:
+        return
+    try:
+        uid_text = "'" + str(user_id)  # force le stockage en TEXTE dans Sheets
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        row_index = _find_row_by_user_id(user_id)
+        if row_index:  # update
+            # A = user_id (texte), B = username, C = level, D = xp, E = last_update
+            sheet.update(f"A{row_index}:E{row_index}",
+                         [[uid_text, username, level, xp, now]],
+                         value_input_option="USER_ENTERED")
+        else:  # insert
+            sheet.append_row([uid_text, username, level, xp, now],
+                             value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"[Google Sheets] Erreur de sauvegarde pour {username}: {e}")
 
 def save_xp_to_sheets(user_id, username, level, xp):
     """Sauvegarde (upsert) du profil utilisateur dans Google Sheets."""
@@ -207,6 +243,56 @@ def fetch_role_for_level(guild_id: int, level: int):
     row = cur.fetchone()
     return row[0] if row else None
 
+def bootstrap_from_sheets(guild_id_hint: int | None = None):
+    """
+    Recharge la base locale depuis Google Sheets (si dispo).
+    - Si guild_id_hint est fourni, on l’utilise ; sinon on met 0 par défaut.
+    """
+    if sheet is None:
+        print("Sheets indisponible : bootstrap ignoré.")
+        return
+
+    try:
+        rows = sheet.get_all_values()
+        if not rows:
+            print("Sheets vide : rien à booter.")
+            return
+
+        # Détecte si première ligne = en-têtes
+        start = 2 if rows and rows[0][:5] == ["user_id", "username", "level", "xp", "last_update"] else 1
+        imported = 0
+
+        for r in rows[start-1:]:
+            if len(r) < 4:
+                continue
+            uid_str = _normalize_uid_cell(r[0])
+            if not uid_str.isdigit():
+                continue
+            user_id = int(uid_str)
+            username = r[1] if len(r) > 1 else ""
+            try:
+                level = int(r[2]) if len(r) > 2 else 0
+            except:
+                level = 0
+            try:
+                xp = int(r[3]) if len(r) > 3 else 0
+            except:
+                xp = 0
+
+            guild_id = guild_id_hint or 0
+            # insère/écrase l’état local avec ce qui est dans Sheets
+            cur.execute(
+                "INSERT OR REPLACE INTO users (guild_id, user_id, xp, level, last_msg_ts) VALUES (?,?,?,?,?)",
+                (guild_id, user_id, xp, level, 0),
+            )
+            imported += 1
+
+        conn.commit()
+        print(f"✅ Bootstrap terminé depuis Sheets : {imported} profils importés.")
+    except Exception as e:
+        print(f"⚠️ Bootstrap Sheets échoué : {e}")
+
+
 # ============================ DISCORD BOT ===============================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -247,6 +333,9 @@ async def grant_xp_and_handle_levelup(member: discord.Member, amount: int):
 @bot.event
 async def on_ready():
     print(f"✅ Connecté en tant que {bot.user}")
+    # Si tu connais ton guild_id principal, passe-le ici pour éviter guild_id=0.
+    # sinon laisse None, on stockera provisoirement sous guild_id=0.
+    await asyncio.to_thread(bootstrap_from_sheets, 809526179643392100)
 
 @bot.event
 async def on_message(message: discord.Message):
