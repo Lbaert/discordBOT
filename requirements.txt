@@ -2,3 +2,5 @@ discord.py==2.4.0
 python-dotenv==1.0.1
 audioop-lts
 aiohttp==3.13.2
+gspread
+google-auth

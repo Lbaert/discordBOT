@@ -1,6 +1,8 @@
 # Empêche d'envoyer ces fichiers sensibles/temporaires
 .env
 levelbot.sqlite3
+credentials.json
+discordlevelbot-*.json
 __pycache__/
 .venv/
 data/
